@@ -156,6 +156,20 @@ def detect(img, key=None, mode='auto', face_frac=0.9):
     if mouth is None:
         raise NotFound('não encontrei boca, nariz/queixo nem rosto' if mode == 'auto' else f'o modo "{mode}" não encontrou nada')
 
+    return finish_detection(mouth, face, method, W, H, face_frac)
+
+
+def manual_detection(img, mouth, face=None, face_frac=0.9):
+    """Detecção informada à mão (caixas x0,y0,x1,y1 em pixels): dispensa o Moondream."""
+    H, W = img.shape[:2]
+    for name, b in (('boca', mouth), ('rosto', face)):
+        if b is not None and not (0 <= b[0] < b[2] <= W and 0 <= b[1] < b[3] <= H):
+            raise VisemirError(f'caixa da {name} {list(b)} fora da imagem {W}x{H} ou com x0>=x1 / y0>=y1')
+    return finish_detection(tuple(mouth), tuple(face) if face else None, 'manual', W, H, face_frac)
+
+
+def finish_detection(mouth, face, method, W, H, face_frac):
+    """Recorte quadrado (x0, y0, lado) em volta da boca, do tamanho do rosto."""
     cx, cy = _center(mouth)
     side = (face[3] - face[1]) * face_frac if face else (mouth[2] - mouth[0]) * 10 * face_frac
     side = int(round(min(max(side, (mouth[2] - mouth[0]) * 3, 64), W, H)))
@@ -516,15 +530,30 @@ def export_files(ref, visemes, det, atlas_name='visemes_atlas', godot_res_dir='r
             '[resource]\natlas = ExtResource("1")\n'
             f'region = Rect2({ax}, {ay}, {s["w"]}, {s["h"]})\n'
             f'margin = Rect2({s["x"]}, {s["y"]}, {W - s["w"]}, {H - s["h"]})\n').encode()
+    # `visemir` é uma chave extra no topo: o Phaser a copia para texture.customData ao carregar o atlas,
+    # então a engine lê a caixa da boca (e o tracking, ver embed_track) do mesmo arquivo do atlas.
     files[f'{atlas_name}.json'] = json.dumps({'frames': frames, 'meta': {
         'app': 'visemir', 'version': '1.0', 'image': f'{atlas_name}.png', 'format': 'RGBA8888',
-        'size': {'w': int(atlas.shape[1]), 'h': int(atlas.shape[0])}, 'scale': '1'}}, indent=2).encode()
+        'size': {'w': int(atlas.shape[1]), 'h': int(atlas.shape[0])}, 'scale': '1'},
+        'visemir': {'version': 1, 'rest': REST, 'mouth': det['mouth'], 'size': [W, H]}}, indent=2).encode()
     files['visemes.json'] = json.dumps({
         'base': {'image': 'base.png', 'w': W, 'h': H}, 'order': NAMES, 'rest': REST,
         'mouth': det['mouth'], 'crop': det['crop'], 'visemes': coords,
         'note': 'x,y = canto superior esquerdo da boca na imagem base, em pixels. Desenhe a boca em cima da base nessa posição.'},
         indent=2).encode()
     return files, atlas
+
+
+def embed_track(atlas_json, fps, size, Hs, ccs):
+    """Grava o tracking de um vídeo dentro do JSON do atlas (chave visemir.track), para a engine colar a boca
+    no vídeo em tempo real: homografias referência->frame (3x3 em linha, pixels do vídeo) + confiança por frame."""
+    data = json.loads(atlas_json)
+    vis = data.setdefault('visemir', {'version': 1, 'rest': REST})
+    g = lambda v: float(f'{float(v):.6g}')
+    vis['track'] = {'fps': g(fps), 'size': [int(size[0]), int(size[1])], 'low': CC_LOW,
+                    'homographies': [[g(v) for v in np.asarray(h, np.float64).ravel()] for h in Hs],
+                    'confidence': [round(float(c), 3) for c in ccs]}
+    return json.dumps(data, indent=1).encode()
 
 
 def write_files(files, out_dir):

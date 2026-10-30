@@ -8,7 +8,9 @@ Comandos:
   detect     acha a boca (boca -> nariz/queixo -> rosto) e a área de recorte
   prepare    só monta o grid + prompt + tamanho (para rodar num modelo de edição local)
   generate   prepare + FLUX 3 (fal) ou --edited GRID + máscaras + visemas + exportação Phaser/Godot
-  track      cola os visemas num vídeo com tracking
+  track      cola os visemas num vídeo com tracking e exporta o atlas com o tracking (pasta <saída>_engine/)
+
+Com --mouth X0,Y0,X1,Y1 (e opcional --face) a boca é informada à mão e o Moondream não é chamado.
   demo       cria um vídeo de teste da imagem se mexendo em zigzag
 """
 import argparse, json, shutil, subprocess, sys, time
@@ -90,6 +92,7 @@ def save_gif(frames, path, ms, max_side=512):
 
 
 def open_writer(path, W, H, fps, audio_src=None):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     if shutil.which('ffmpeg'):
         cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{W}x{H}', '-r', str(fps), '-i', '-']
         if audio_src:
@@ -102,6 +105,11 @@ def open_writer(path, W, H, fps, audio_src=None):
 
 
 def find_ref(a, src):
+    if a.mouth:  # caixa informada à mão: sem Moondream
+        if not 0 <= a.frame < src.n:
+            raise core.VisemirError(f'frame {a.frame} fora da entrada (0..{src.n - 1})')
+        fr = src.get(a.frame)
+        return a.frame, fr, core.manual_detection(fr, a.mouth, a.face, a.face_frac)
     return core.find_reference(src.get, src.n, a.frame, a.retry_step, a.max_attempts, None, a.mode, a.face_frac)
 
 
@@ -230,6 +238,9 @@ def cmd_track(a):
     close()
     Path(a.output).with_suffix('.track.json').write_text(json.dumps(
         {'fps': src.fps, 'ref_frame': ref_index, 'homographies_ref_to_frame': [h.tolist() for h in Hs], 'confidence': ccs}))
+    eng = engine_export(sd, Path(a.output).with_name(Path(a.output).stem + '_engine'), src.fps, (w, h), Hs, ccs)
+    if eng:
+        log(f'engine: {eng} (atlas com o tracking deste vídeo em visemir.track)')
     log(f'pronto: {a.output}  ({src.n} frames, {(time.time() - t0) / src.n * 1000:.0f} ms/frame, frame de referência {ref_index})')
     low = sum(c < core.CC_LOW for c in ccs)
     if low:
@@ -256,6 +267,29 @@ def cmd_demo(a):
     log(f'pronto: {a.output}  (movimento real em {gp})')
 
 
+def box(s):
+    try:
+        v = [float(x) for x in s.split(',')]
+    except ValueError:
+        v = []
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError(f'esperava X0,Y0,X1,Y1 em pixels, recebi {s!r}')
+    return v
+
+
+def engine_export(sd, out_dir, fps, size, Hs, ccs):
+    """Atlas do set + tracking deste vídeo num JSON só (visemir.track), pronto para a engine."""
+    atlases = [p for p in sorted((sd / 'export').glob('*.json'))
+               if json.loads(p.read_text()).get('meta', {}).get('app') == 'visemir']
+    if not atlases:
+        log(f'aviso: {sd / "export"} não tem atlas do visemir; exportação para engine pulada')
+        return None
+    src = atlases[0]; out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src.with_suffix('.png'), out_dir / src.with_suffix('.png').name)
+    (out_dir / src.name).write_bytes(core.embed_track(src.read_text(), fps, size, Hs, ccs))
+    return out_dir / src.name
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='visemir', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest='cmd', required=True)
@@ -267,6 +301,8 @@ def main(argv=None):
     loc.add_argument('--max-attempts', type=int, default=5, help='máximo de frames tentados (padrão 5)')
     loc.add_argument('--mode', choices=core.DETECT_MODES, default='auto', help='auto = boca -> nariz/queixo -> rosto')
     loc.add_argument('--face-frac', type=float, default=0.9, help='tamanho do recorte / altura do rosto (padrão 0.9)')
+    loc.add_argument('--mouth', type=box, metavar='X0,Y0,X1,Y1', help='caixa da boca em pixels: pula o Moondream')
+    loc.add_argument('--face', type=box, metavar='X0,Y0,X1,Y1', help='caixa do rosto em pixels (com --mouth; define o recorte)')
 
     d = sp.add_parser('detect', parents=[loc], help='acha a boca e a área de recorte')
     d.add_argument('input'); d.add_argument('--debug', metavar='PNG', help='salva imagem com as caixas')
